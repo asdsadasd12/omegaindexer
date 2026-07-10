@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import urljoin, urlparse
 
+import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
@@ -46,6 +47,50 @@ def normalize_url(url: str) -> str:
 
 def split_lines(value: str) -> list[str]:
     return [line.strip() for line in value.splitlines() if line.strip()]
+
+
+def deduplicate_urls(urls: Iterable[str]) -> tuple[list[str], int]:
+    materialized_urls = list(urls)
+    unique_urls = list(dict.fromkeys(materialized_urls))
+    removed_duplicates = max(0, len(materialized_urls) - len(unique_urls))
+    return unique_urls, removed_duplicates
+
+
+def build_unique_url_rows(results: dict[str, dict[str, object]]) -> tuple[list[dict[str, object]], int]:
+    rows: list[dict[str, object]] = []
+    seen_urls: set[str] = set()
+    removed_duplicates = 0
+
+    for site, site_result in results.items():
+        links = site_result["links"]
+        for url in links:
+            if url in seen_urls:
+                removed_duplicates += 1
+                continue
+            seen_urls.add(url)
+            rows.append(
+                {
+                    "selected": True,
+                    "site": site,
+                    "url": url,
+                }
+            )
+
+    return rows, removed_duplicates
+
+
+def set_all_selected(value: bool) -> None:
+    rows = st.session_state.get("crawl_url_rows", [])
+    st.session_state["crawl_url_rows"] = [
+        {**row, "selected": value} for row in rows
+    ]
+
+
+def invert_selected() -> None:
+    rows = st.session_state.get("crawl_url_rows", [])
+    st.session_state["crawl_url_rows"] = [
+        {**row, "selected": not bool(row["selected"])} for row in rows
+    ]
 
 
 def build_pipe_delimited_urls(urls: Iterable[str]) -> str:
@@ -154,15 +199,18 @@ def main() -> None:
 
         if st.button("Send URLs to OmegaIndexer", type="primary"):
             try:
-                urls = [normalize_url(url) for url in split_lines(raw_urls)]
+                normalized_urls = [
+                    normalize_url(url) for url in split_lines(raw_urls)
+                ]
             except ValueError as exc:
                 st.error(str(exc))
             else:
                 if not api_key:
                     st.error("Enter your OmegaIndexer API key in the sidebar.")
-                elif not urls:
+                elif not normalized_urls:
                     st.error("Add at least one URL.")
                 else:
+                    urls, removed_duplicates = deduplicate_urls(normalized_urls)
                     payload = OmegaCampaignPayload(
                         apikey=api_key,
                         campaignname=campaign_name.strip() or "Manual campaign",
@@ -172,6 +220,10 @@ def main() -> None:
                     success, message = send_to_omega(payload)
                     if success:
                         st.success("Campaign request sent successfully.")
+                        st.caption(
+                            f"Unique URLs sent: {len(urls)}. "
+                            f"Removed duplicates: {removed_duplicates}."
+                        )
                         st.code(message)
                     else:
                         st.error("OmegaIndexer rejected the request.")
@@ -210,11 +262,24 @@ def main() -> None:
                         results[site] = {"error": "", "links": links}
                         all_urls.extend(links)
 
+                unique_crawl_urls, removed_duplicates = deduplicate_urls(all_urls)
+                crawl_url_rows, row_duplicates_removed = build_unique_url_rows(
+                    results
+                )
                 st.session_state["crawl_results"] = results
-                st.session_state["crawl_urls"] = sorted(set(all_urls))
+                st.session_state["crawl_urls"] = unique_crawl_urls
+                st.session_state["crawl_url_rows"] = crawl_url_rows
+                st.session_state["crawl_duplicates_removed"] = max(
+                    removed_duplicates,
+                    row_duplicates_removed,
+                )
 
         crawl_results = st.session_state.get("crawl_results")
-        crawl_urls = st.session_state.get("crawl_urls", [])
+        crawl_url_rows = st.session_state.get("crawl_url_rows", [])
+        crawl_duplicates_removed = st.session_state.get(
+            "crawl_duplicates_removed",
+            0,
+        )
 
         if crawl_results:
             st.markdown("### Results")
@@ -226,19 +291,61 @@ def main() -> None:
                 else:
                     st.write(f"{site}: found {len(links)} internal links")
 
-            st.markdown(f"### Total unique URLs: {len(crawl_urls)}")
-            st.text_area(
-                "Collected URLs",
-                value="\n".join(crawl_urls),
-                height=220,
-                disabled=True,
+            selected_urls = [
+                row["url"] for row in crawl_url_rows if bool(row["selected"])
+            ]
+
+            st.markdown(f"### Total unique URLs: {len(crawl_url_rows)}")
+            st.caption(f"Selected now: {len(selected_urls)}")
+            st.caption(f"Removed duplicates: {crawl_duplicates_removed}")
+
+            action_col_1, action_col_2, action_col_3 = st.columns(3)
+            with action_col_1:
+                st.button("Select all", on_click=set_all_selected, args=(True,))
+            with action_col_2:
+                st.button("Clear all", on_click=set_all_selected, args=(False,))
+            with action_col_3:
+                st.button("Invert selection", on_click=invert_selected)
+
+            edited_rows_df = st.data_editor(
+                pd.DataFrame(crawl_url_rows),
+                hide_index=True,
+                width="stretch",
+                height=320,
+                key="crawl_url_editor",
+                disabled=["site", "url"],
+                column_config={
+                    "selected": st.column_config.CheckboxColumn(
+                        "Send",
+                        help="Choose which pages to send to OmegaIndexer.",
+                        default=True,
+                    ),
+                    "site": st.column_config.TextColumn(
+                        "Source site",
+                        width="small",
+                    ),
+                    "url": st.column_config.LinkColumn(
+                        "Page URL",
+                        display_text="Open page",
+                        width="large",
+                    ),
+                },
             )
+            st.session_state["crawl_url_rows"] = edited_rows_df.to_dict("records")
+
+            selected_urls = [
+                row["url"]
+                for row in st.session_state["crawl_url_rows"]
+                if bool(row["selected"])
+            ]
 
             if st.button("Send collected URLs to OmegaIndexer", type="primary"):
                 if not api_key:
                     st.error("Enter your OmegaIndexer API key in the sidebar.")
-                elif not crawl_urls:
+                elif not crawl_url_rows:
                     st.error("No URLs were collected yet.")
+                elif not selected_urls:
+                    st.error("Select at least one page.")
                 else:
                     payload = OmegaCampaignPayload(
                         apikey=api_key,
@@ -246,12 +353,16 @@ def main() -> None:
                             crawl_campaign_name.strip()
                             or "Homepage crawl campaign"
                         ),
-                        urls=build_pipe_delimited_urls(crawl_urls),
+                        urls=build_pipe_delimited_urls(selected_urls),
                         dripfeed=str(dripfeed_days),
                     )
                     success, message = send_to_omega(payload)
                     if success:
                         st.success("Collected URLs sent successfully.")
+                        st.caption(
+                            f"Unique URLs sent: {len(selected_urls)}. "
+                            f"Removed duplicates: {crawl_duplicates_removed}."
+                        )
                         st.code(message)
                     else:
                         st.error("OmegaIndexer rejected the request.")
