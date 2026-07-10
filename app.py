@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from dataclasses import dataclass
 from typing import Iterable
@@ -16,6 +17,7 @@ GOOGLEBOT_UA = (
 )
 SITEMAP_PRIORITY_MARKER = "/sitemap-page"
 DEFAULT_SITEMAP_PRIORITY_PATH = "/top/sitemap-page-1/"
+VALIDATION_MAX_WORKERS = 10
 
 
 @dataclass
@@ -200,8 +202,9 @@ def validate_page_for_indexing(
     if canonical_href:
         canonical_url = normalize_comparable_url(urljoin(response.url, canonical_href))
 
+    has_external_canonical = bool(canonical_url) and canonical_url != normalized_requested
     is_self_canonical = canonical_url == normalized_requested
-    if not is_self_canonical:
+    if has_external_canonical:
         return PageCheckResult(
             url=url,
             final_url=final_url,
@@ -212,7 +215,7 @@ def validate_page_for_indexing(
             is_self_canonical=False,
             is_indexable=False,
             is_valid=False,
-            reason="Canonical is missing or not self-referencing",
+            reason="Canonical points to another URL",
         )
 
     x_robots = response.headers.get("X-Robots-Tag", "")
@@ -234,7 +237,7 @@ def validate_page_for_indexing(
             status_code=status_code,
             canonical_url=canonical_url,
             is_sitemap=SITEMAP_PRIORITY_MARKER in url.lower(),
-            is_self_canonical=True,
+            is_self_canonical=is_self_canonical,
             is_indexable=False,
             is_valid=False,
             reason="Page is blocked from indexing by robots directives",
@@ -247,7 +250,7 @@ def validate_page_for_indexing(
         status_code=status_code,
         canonical_url=canonical_url,
         is_sitemap=SITEMAP_PRIORITY_MARKER in url.lower(),
-        is_self_canonical=True,
+        is_self_canonical=is_self_canonical,
         is_indexable=True,
         is_valid=True,
         reason="OK",
@@ -453,20 +456,26 @@ def main() -> None:
                 progress_bar = st.progress(0)
 
                 if unique_crawl_urls:
-                    for index, url in enumerate(unique_crawl_urls, start=1):
-                        source_site = urlparse(url).netloc
-                        check_result = validate_page_for_indexing(
-                            source_site,
-                            url,
-                            timeout=int(request_timeout),
-                        )
-                        if check_result.is_valid:
-                            valid_page_records.append(check_result)
-                        else:
-                            excluded_page_records.append(check_result)
-                        progress_bar.progress(
-                            int(index / len(unique_crawl_urls) * 100)
-                        )
+                    with ThreadPoolExecutor(max_workers=VALIDATION_MAX_WORKERS) as executor:
+                        future_to_url = {
+                            executor.submit(
+                                validate_page_for_indexing,
+                                urlparse(url).netloc,
+                                url,
+                                int(request_timeout),
+                            ): url
+                            for url in unique_crawl_urls
+                        }
+
+                        for index, future in enumerate(as_completed(future_to_url), start=1):
+                            check_result = future.result()
+                            if check_result.is_valid:
+                                valid_page_records.append(check_result)
+                            else:
+                                excluded_page_records.append(check_result)
+                            progress_bar.progress(
+                                int(index / len(unique_crawl_urls) * 100)
+                            )
 
                 progress_bar.empty()
                 filtered_crawl_urls = prioritize_and_limit_urls(
