@@ -333,7 +333,7 @@ def main() -> None:
             "Drip-feed days",
             min_value=1,
             max_value=30,
-            value=7,
+            value=1,
             step=1,
         )
         request_timeout = st.number_input(
@@ -360,54 +360,9 @@ def main() -> None:
         )
         render_payload_help()
 
-    manual_tab, crawl_tab = st.tabs(
-        ["Manual URL submission", "Collect from homepage links"]
+    crawl_tab, manual_tab = st.tabs(
+        ["Collect from homepage links", "Manual URL submission"]
     )
-
-    with manual_tab:
-        st.subheader("Send your own URLs")
-        campaign_name = st.text_input(
-            "Campaign name",
-            value="Manual campaign",
-            key="manual_campaign_name",
-        )
-        raw_urls = st.text_area(
-            "URLs (one per line)",
-            height=220,
-            placeholder="https://example.com/page-1\nhttps://example.com/page-2",
-        )
-
-        if st.button("Send URLs to OmegaIndexer", type="primary"):
-            try:
-                normalized_urls = [
-                    normalize_url(url) for url in split_lines(raw_urls)
-                ]
-            except ValueError as exc:
-                st.error(str(exc))
-            else:
-                if not api_key:
-                    st.error("Enter your OmegaIndexer API key in the sidebar.")
-                elif not normalized_urls:
-                    st.error("Add at least one URL.")
-                else:
-                    urls, removed_duplicates = deduplicate_urls(normalized_urls)
-                    payload = OmegaCampaignPayload(
-                        apikey=api_key,
-                        campaignname=campaign_name.strip() or "Manual campaign",
-                        urls=build_pipe_delimited_urls(urls),
-                        dripfeed=str(dripfeed_days),
-                    )
-                    success, message = send_to_omega(payload)
-                    if success:
-                        st.success("Campaign request sent successfully.")
-                        st.caption(
-                            f"Unique URLs sent: {len(urls)}. "
-                            f"Removed duplicates: {removed_duplicates}."
-                        )
-                        st.code(message)
-                    else:
-                        st.error("OmegaIndexer rejected the request.")
-                        st.code(message)
 
     with crawl_tab:
         st.subheader("Collect internal links from site homepages")
@@ -645,6 +600,51 @@ def main() -> None:
                         st.caption(
                             f"Unique URLs sent: {len(selected_urls)}. "
                             f"Removed duplicates: {crawl_duplicates_removed}."
+                        )
+                        st.code(message)
+                    else:
+                        st.error("OmegaIndexer rejected the request.")
+                        st.code(message)
+
+    with manual_tab:
+        st.subheader("Send your own URLs")
+        campaign_name = st.text_input(
+            "Campaign name",
+            value="Manual campaign",
+            key="manual_campaign_name",
+        )
+        raw_urls = st.text_area(
+            "URLs (one per line)",
+            height=220,
+            placeholder="https://example.com/page-1\nhttps://example.com/page-2",
+        )
+
+        if st.button("Send URLs to OmegaIndexer", type="primary"):
+            try:
+                normalized_urls = [
+                    normalize_url(url) for url in split_lines(raw_urls)
+                ]
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                if not api_key:
+                    st.error("Enter your OmegaIndexer API key in the sidebar.")
+                elif not normalized_urls:
+                    st.error("Add at least one URL.")
+                else:
+                    urls, removed_duplicates = deduplicate_urls(normalized_urls)
+                    payload = OmegaCampaignPayload(
+                        apikey=api_key,
+                        campaignname=campaign_name.strip() or "Manual campaign",
+                        urls=build_pipe_delimited_urls(urls),
+                        dripfeed=str(dripfeed_days),
+                    )
+                    success, message = send_to_omega(payload)
+                    if success:
+                        st.success("Campaign request sent successfully.")
+                        st.caption(
+                            f"Unique URLs sent: {len(urls)}. "
+                            f"Removed duplicates: {removed_duplicates}."
                         )
                         st.code(message)
                     else:
