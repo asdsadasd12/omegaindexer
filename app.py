@@ -100,6 +100,19 @@ def build_pipe_delimited_urls(urls: Iterable[str]) -> str:
     return "|".join(urls)
 
 
+def group_urls_by_domain(urls: Iterable[str]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for url in urls:
+        domain = urlparse(url).netloc
+        grouped.setdefault(domain, []).append(url)
+    return grouped
+
+
+def build_campaign_name(base_name: str, domain: str) -> str:
+    cleaned_name = base_name.strip() or "Homepage crawl campaign"
+    return f"{cleaned_name} - {domain}"
+
+
 def build_start_url(site_url: str, start_path: str) -> str:
     normalized_site = normalize_url(site_url)
     cleaned_path = start_path.strip() or "/"
@@ -125,6 +138,26 @@ def prioritize_and_limit_urls(
     ]
     ordered_urls = prioritized_urls + regular_urls
     return ordered_urls[:max_urls]
+
+
+def prioritize_and_limit_by_domain(
+    urls: Iterable[str],
+    max_urls: int,
+    prioritize_sitemap: bool,
+) -> list[str]:
+    grouped_urls = group_urls_by_domain(urls)
+    limited_urls: list[str] = []
+
+    for domain_urls in grouped_urls.values():
+        limited_urls.extend(
+            prioritize_and_limit_urls(
+                domain_urls,
+                max_urls=max_urls,
+                prioritize_sitemap=prioritize_sitemap,
+            )
+        )
+
+    return limited_urls
 
 
 def build_priority_sitemap_url(site_url: str) -> str:
@@ -376,6 +409,11 @@ def main() -> None:
             value="Homepage crawl campaign",
             key="crawl_campaign_name",
         )
+        separate_campaigns_per_domain = st.checkbox(
+            "Create separate campaign for each domain",
+            value=True,
+            help="If enabled, each domain will be sent to OmegaIndexer as its own campaign.",
+        )
         start_path = st.text_input(
             "Page path to parse",
             value="/",
@@ -433,11 +471,18 @@ def main() -> None:
                             )
 
                 progress_bar.empty()
-                filtered_crawl_urls = prioritize_and_limit_urls(
-                    [record.url for record in valid_page_records],
-                    max_urls=int(crawl_limit),
-                    prioritize_sitemap=prioritize_sitemap,
-                )
+                if separate_campaigns_per_domain:
+                    filtered_crawl_urls = prioritize_and_limit_by_domain(
+                        [record.url for record in valid_page_records],
+                        max_urls=int(crawl_limit),
+                        prioritize_sitemap=prioritize_sitemap,
+                    )
+                else:
+                    filtered_crawl_urls = prioritize_and_limit_urls(
+                        [record.url for record in valid_page_records],
+                        max_urls=int(crawl_limit),
+                        prioritize_sitemap=prioritize_sitemap,
+                    )
                 valid_record_map = {record.url: record for record in valid_page_records}
                 filtered_valid_records = [
                     valid_record_map[url]
@@ -453,6 +498,9 @@ def main() -> None:
                 st.session_state["crawl_limit_applied"] = int(crawl_limit)
                 st.session_state["crawl_prioritize_sitemap"] = prioritize_sitemap
                 st.session_state["crawl_start_path"] = start_path.strip() or "/"
+                st.session_state["crawl_separate_campaigns"] = (
+                    separate_campaigns_per_domain
+                )
                 st.session_state["crawl_valid_records"] = [
                     asdict(record) for record in filtered_valid_records
                 ]
@@ -476,6 +524,10 @@ def main() -> None:
             True,
         )
         crawl_start_path = st.session_state.get("crawl_start_path", "/")
+        crawl_separate_campaigns = st.session_state.get(
+            "crawl_separate_campaigns",
+            True,
+        )
         crawl_valid_before_limit = st.session_state.get(
             "crawl_valid_before_limit",
             len(crawl_urls),
@@ -505,6 +557,9 @@ def main() -> None:
                 st.caption(
                     "Sitemap Page priority is enabled. Matching URLs are kept first."
                 )
+            if crawl_separate_campaigns:
+                st.caption("Selected URLs will be sent as separate campaigns per domain.")
+                st.caption("Page limit is applied separately to each domain.")
 
             action_col_1, action_col_2, action_col_3 = st.columns(3)
             with action_col_1:
@@ -585,26 +640,56 @@ def main() -> None:
                 elif not selected_urls:
                     st.error("Select at least one page.")
                 else:
-                    payload = OmegaCampaignPayload(
-                        apikey=api_key,
-                        campaignname=(
-                            crawl_campaign_name.strip()
-                            or "Homepage crawl campaign"
-                        ),
-                        urls=build_pipe_delimited_urls(selected_urls),
-                        dripfeed=str(dripfeed_days),
-                    )
-                    success, message = send_to_omega(payload)
-                    if success:
-                        st.success("Collected URLs sent successfully.")
-                        st.caption(
-                            f"Unique URLs sent: {len(selected_urls)}. "
-                            f"Removed duplicates: {crawl_duplicates_removed}."
-                        )
-                        st.code(message)
+                    if crawl_separate_campaigns:
+                        grouped_urls = group_urls_by_domain(selected_urls)
+                        sent_domains = 0
+                        for domain, domain_urls in grouped_urls.items():
+                            payload = OmegaCampaignPayload(
+                                apikey=api_key,
+                                campaignname=build_campaign_name(
+                                    crawl_campaign_name,
+                                    domain,
+                                ),
+                                urls=build_pipe_delimited_urls(domain_urls),
+                                dripfeed=str(dripfeed_days),
+                            )
+                            success, message = send_to_omega(payload)
+                            if success:
+                                sent_domains += 1
+                                st.success(
+                                    f"{domain}: campaign sent with {len(domain_urls)} URLs."
+                                )
+                                st.code(message)
+                            else:
+                                st.error(f"{domain}: OmegaIndexer rejected the request.")
+                                st.code(message)
+
+                        if sent_domains:
+                            st.caption(
+                                f"Domains sent: {sent_domains}. "
+                                f"Total URLs sent: {len(selected_urls)}."
+                            )
                     else:
-                        st.error("OmegaIndexer rejected the request.")
-                        st.code(message)
+                        payload = OmegaCampaignPayload(
+                            apikey=api_key,
+                            campaignname=(
+                                crawl_campaign_name.strip()
+                                or "Homepage crawl campaign"
+                            ),
+                            urls=build_pipe_delimited_urls(selected_urls),
+                            dripfeed=str(dripfeed_days),
+                        )
+                        success, message = send_to_omega(payload)
+                        if success:
+                            st.success("Collected URLs sent successfully.")
+                            st.caption(
+                                f"Unique URLs sent: {len(selected_urls)}. "
+                                f"Removed duplicates: {crawl_duplicates_removed}."
+                            )
+                            st.code(message)
+                        else:
+                            st.error("OmegaIndexer rejected the request.")
+                            st.code(message)
 
     with manual_tab:
         st.subheader("Send your own URLs")
