@@ -146,10 +146,10 @@ def prioritize_and_limit_by_domain(
     prioritize_sitemap: bool,
 ) -> list[str]:
     grouped_urls = group_urls_by_domain(urls)
-    limited_urls: list[str] = []
+    limited_groups: list[list[str]] = []
 
     for domain_urls in grouped_urls.values():
-        limited_urls.extend(
+        limited_groups.append(
             prioritize_and_limit_urls(
                 domain_urls,
                 max_urls=max_urls,
@@ -157,7 +157,22 @@ def prioritize_and_limit_by_domain(
             )
         )
 
-    return limited_urls
+    if not prioritize_sitemap:
+        return [url for group in limited_groups for url in group]
+
+    prioritized_urls = [
+        url
+        for group in limited_groups
+        for url in group
+        if SITEMAP_PRIORITY_MARKER in url.lower()
+    ]
+    regular_urls = [
+        url
+        for group in limited_groups
+        for url in group
+        if SITEMAP_PRIORITY_MARKER not in url.lower()
+    ]
+    return prioritized_urls + regular_urls
 
 
 def build_priority_sitemap_url(site_url: str) -> str:
@@ -383,6 +398,11 @@ def main() -> None:
             value=50,
             step=1,
         )
+        limit_per_domain = st.checkbox(
+            "Apply page limit per domain",
+            value=True,
+            help="If enabled, the page limit is counted separately for each domain.",
+        )
         prioritize_sitemap = st.checkbox(
             "Prioritize Sitemap Page URLs",
             value=True,
@@ -471,19 +491,23 @@ def main() -> None:
                             )
 
                 progress_bar.empty()
-                if separate_campaigns_per_domain:
+                valid_record_map = {record.url: record for record in valid_page_records}
+                ordered_valid_urls = [
+                    url for url in unique_crawl_urls if url in valid_record_map
+                ]
+
+                if limit_per_domain:
                     filtered_crawl_urls = prioritize_and_limit_by_domain(
-                        [record.url for record in valid_page_records],
+                        ordered_valid_urls,
                         max_urls=int(crawl_limit),
                         prioritize_sitemap=prioritize_sitemap,
                     )
                 else:
                     filtered_crawl_urls = prioritize_and_limit_urls(
-                        [record.url for record in valid_page_records],
+                        ordered_valid_urls,
                         max_urls=int(crawl_limit),
                         prioritize_sitemap=prioritize_sitemap,
                     )
-                valid_record_map = {record.url: record for record in valid_page_records}
                 filtered_valid_records = [
                     valid_record_map[url]
                     for url in filtered_crawl_urls
@@ -496,6 +520,7 @@ def main() -> None:
                 st.session_state["crawl_total_before_limit"] = len(unique_crawl_urls)
                 st.session_state["crawl_valid_before_limit"] = len(valid_page_records)
                 st.session_state["crawl_limit_applied"] = int(crawl_limit)
+                st.session_state["crawl_limit_per_domain"] = limit_per_domain
                 st.session_state["crawl_prioritize_sitemap"] = prioritize_sitemap
                 st.session_state["crawl_start_path"] = start_path.strip() or "/"
                 st.session_state["crawl_separate_campaigns"] = (
@@ -521,6 +546,10 @@ def main() -> None:
         crawl_limit_applied = st.session_state.get("crawl_limit_applied", 50)
         crawl_prioritize_sitemap = st.session_state.get(
             "crawl_prioritize_sitemap",
+            True,
+        )
+        crawl_limit_per_domain = st.session_state.get(
+            "crawl_limit_per_domain",
             True,
         )
         crawl_start_path = st.session_state.get("crawl_start_path", "/")
@@ -555,11 +584,12 @@ def main() -> None:
             )
             if crawl_prioritize_sitemap:
                 st.caption(
-                    "Sitemap Page priority is enabled. Matching URLs are kept first."
+                    "Sitemap Page priority is enabled. All sitemap URLs are queued before other pages."
                 )
+            if crawl_limit_per_domain:
+                st.caption("Page limit is applied separately to each domain.")
             if crawl_separate_campaigns:
                 st.caption("Selected URLs will be sent as separate campaigns per domain.")
-                st.caption("Page limit is applied separately to each domain.")
 
             action_col_1, action_col_2, action_col_3 = st.columns(3)
             with action_col_1:
