@@ -27,3 +27,7 @@ The `dripfeed` field is in days and the public page says the maximum is `30`.
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## Documentation
+
+- Russian wiki/instruction: [WIKI_RU.md](C:/Users/cas/Documents/GitHub/omegaindexer/WIKI_RU.md)

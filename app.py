@@ -395,7 +395,7 @@ def main() -> None:
             "Max pages to keep",
             min_value=1,
             max_value=100,
-            value=50,
+            value=20,
             step=1,
         )
         limit_per_domain = st.checkbox(
@@ -543,7 +543,7 @@ def main() -> None:
             "crawl_total_before_limit",
             len(crawl_urls),
         )
-        crawl_limit_applied = st.session_state.get("crawl_limit_applied", 50)
+        crawl_limit_applied = st.session_state.get("crawl_limit_applied", 20)
         crawl_prioritize_sitemap = st.session_state.get(
             "crawl_prioritize_sitemap",
             True,
