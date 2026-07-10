@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import urljoin, urlparse
@@ -31,6 +32,20 @@ class OmegaCampaignPayload:
             "urls": self.urls,
             "dripfeed": self.dripfeed,
         }
+
+
+@dataclass
+class PageCheckResult:
+    url: str
+    final_url: str
+    site: str
+    status_code: int
+    canonical_url: str
+    is_sitemap: bool
+    is_self_canonical: bool
+    is_indexable: bool
+    is_valid: bool
+    reason: str
 
 
 def normalize_url(url: str) -> str:
@@ -72,6 +87,13 @@ def set_multiselect_selection(mode: str) -> None:
         ]
 
 
+def normalize_comparable_url(url: str) -> str:
+    parsed = urlparse(normalize_url(url))
+    path = parsed.path or "/"
+    normalized_path = path.rstrip("/") or "/"
+    return f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
+
+
 def build_pipe_delimited_urls(urls: Iterable[str]) -> str:
     return "|".join(urls)
 
@@ -106,6 +128,130 @@ def prioritize_and_limit_urls(
 def build_priority_sitemap_url(site_url: str) -> str:
     normalized_site = normalize_url(site_url)
     return urljoin(f"{normalized_site}/", DEFAULT_SITEMAP_PRIORITY_PATH.lstrip("/"))
+
+
+def has_noindex_directive(value: str) -> bool:
+    directives = [part.strip().lower() for part in value.split(",") if part.strip()]
+    return "noindex" in directives or "none" in directives
+
+
+def validate_page_for_indexing(
+    site: str,
+    url: str,
+    timeout: int = 20,
+) -> PageCheckResult:
+    normalized_requested = normalize_comparable_url(url)
+
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": GOOGLEBOT_UA},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        status_code = response.status_code
+        final_url = normalize_comparable_url(response.url)
+    except Exception as exc:  # noqa: BLE001
+        return PageCheckResult(
+            url=url,
+            final_url="",
+            site=site,
+            status_code=0,
+            canonical_url="",
+            is_sitemap=SITEMAP_PRIORITY_MARKER in url.lower(),
+            is_self_canonical=False,
+            is_indexable=False,
+            is_valid=False,
+            reason=str(exc),
+        )
+
+    if status_code != 200:
+        return PageCheckResult(
+            url=url,
+            final_url=final_url,
+            site=site,
+            status_code=status_code,
+            canonical_url="",
+            is_sitemap=SITEMAP_PRIORITY_MARKER in url.lower(),
+            is_self_canonical=False,
+            is_indexable=False,
+            is_valid=False,
+            reason="HTTP status is not 200",
+        )
+
+    if final_url != normalized_requested:
+        return PageCheckResult(
+            url=url,
+            final_url=final_url,
+            site=site,
+            status_code=status_code,
+            canonical_url="",
+            is_sitemap=SITEMAP_PRIORITY_MARKER in url.lower(),
+            is_self_canonical=False,
+            is_indexable=False,
+            is_valid=False,
+            reason="URL redirects to another final URL",
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    canonical_tag = soup.find("link", attrs={"rel": lambda value: value and "canonical" in value})
+    canonical_href = canonical_tag.get("href", "").strip() if canonical_tag else ""
+    canonical_url = ""
+    if canonical_href:
+        canonical_url = normalize_comparable_url(urljoin(response.url, canonical_href))
+
+    is_self_canonical = canonical_url == normalized_requested
+    if not is_self_canonical:
+        return PageCheckResult(
+            url=url,
+            final_url=final_url,
+            site=site,
+            status_code=status_code,
+            canonical_url=canonical_url,
+            is_sitemap=SITEMAP_PRIORITY_MARKER in url.lower(),
+            is_self_canonical=False,
+            is_indexable=False,
+            is_valid=False,
+            reason="Canonical is missing or not self-referencing",
+        )
+
+    x_robots = response.headers.get("X-Robots-Tag", "")
+    robots_meta_values = []
+    for meta_tag in soup.find_all("meta"):
+        meta_name = (meta_tag.get("name") or meta_tag.get("property") or "").strip().lower()
+        if meta_name in {"robots", "googlebot"}:
+            robots_meta_values.append(meta_tag.get("content", ""))
+
+    robots_blocked = has_noindex_directive(x_robots) or any(
+        has_noindex_directive(value) for value in robots_meta_values
+    )
+
+    if robots_blocked:
+        return PageCheckResult(
+            url=url,
+            final_url=final_url,
+            site=site,
+            status_code=status_code,
+            canonical_url=canonical_url,
+            is_sitemap=SITEMAP_PRIORITY_MARKER in url.lower(),
+            is_self_canonical=True,
+            is_indexable=False,
+            is_valid=False,
+            reason="Page is blocked from indexing by robots directives",
+        )
+
+    return PageCheckResult(
+        url=url,
+        final_url=final_url,
+        site=site,
+        status_code=status_code,
+        canonical_url=canonical_url,
+        is_sitemap=SITEMAP_PRIORITY_MARKER in url.lower(),
+        is_self_canonical=True,
+        is_indexable=True,
+        is_valid=True,
+        reason="OK",
+    )
 
 
 def fetch_homepage_links(
@@ -197,7 +343,7 @@ def main() -> None:
         crawl_limit = st.number_input(
             "Max pages to keep",
             min_value=1,
-            max_value=1000,
+            max_value=100,
             value=100,
             step=1,
         )
@@ -302,19 +448,53 @@ def main() -> None:
                         all_urls.extend(links)
 
                 unique_crawl_urls, removed_duplicates = deduplicate_urls(all_urls)
+                valid_page_records: list[PageCheckResult] = []
+                excluded_page_records: list[PageCheckResult] = []
+                progress_bar = st.progress(0)
+
+                if unique_crawl_urls:
+                    for index, url in enumerate(unique_crawl_urls, start=1):
+                        source_site = urlparse(url).netloc
+                        check_result = validate_page_for_indexing(
+                            source_site,
+                            url,
+                            timeout=int(request_timeout),
+                        )
+                        if check_result.is_valid:
+                            valid_page_records.append(check_result)
+                        else:
+                            excluded_page_records.append(check_result)
+                        progress_bar.progress(
+                            int(index / len(unique_crawl_urls) * 100)
+                        )
+
+                progress_bar.empty()
                 filtered_crawl_urls = prioritize_and_limit_urls(
-                    unique_crawl_urls,
+                    [record.url for record in valid_page_records],
                     max_urls=int(crawl_limit),
                     prioritize_sitemap=prioritize_sitemap,
                 )
+                valid_record_map = {record.url: record for record in valid_page_records}
+                filtered_valid_records = [
+                    valid_record_map[url]
+                    for url in filtered_crawl_urls
+                    if url in valid_record_map
+                ]
                 st.session_state["crawl_results"] = results
                 st.session_state["crawl_urls"] = filtered_crawl_urls
                 st.session_state["selected_crawl_urls"] = list(filtered_crawl_urls)
                 st.session_state["crawl_duplicates_removed"] = removed_duplicates
                 st.session_state["crawl_total_before_limit"] = len(unique_crawl_urls)
+                st.session_state["crawl_valid_before_limit"] = len(valid_page_records)
                 st.session_state["crawl_limit_applied"] = int(crawl_limit)
                 st.session_state["crawl_prioritize_sitemap"] = prioritize_sitemap
                 st.session_state["crawl_start_path"] = start_path.strip() or "/"
+                st.session_state["crawl_valid_records"] = [
+                    asdict(record) for record in filtered_valid_records
+                ]
+                st.session_state["crawl_excluded_records"] = [
+                    asdict(record) for record in excluded_page_records
+                ]
 
         crawl_results = st.session_state.get("crawl_results")
         crawl_urls = st.session_state.get("crawl_urls", [])
@@ -332,6 +512,12 @@ def main() -> None:
             True,
         )
         crawl_start_path = st.session_state.get("crawl_start_path", "/")
+        crawl_valid_before_limit = st.session_state.get(
+            "crawl_valid_before_limit",
+            len(crawl_urls),
+        )
+        crawl_valid_records = st.session_state.get("crawl_valid_records", [])
+        crawl_excluded_records = st.session_state.get("crawl_excluded_records", [])
 
         if crawl_results:
             st.markdown("### Results")
@@ -348,6 +534,7 @@ def main() -> None:
             st.caption(
                 f"Start page: {crawl_start_path} | "
                 f"Before limit: {crawl_total_before_limit} | "
+                f"Valid after checks: {crawl_valid_before_limit} | "
                 f"Limit applied: {crawl_limit_applied}"
             )
             if crawl_prioritize_sitemap:
@@ -384,12 +571,47 @@ def main() -> None:
             )
 
             st.caption(f"Selected now: {len(selected_urls)}")
-            st.text_area(
-                "All collected pages",
-                value="\n".join(crawl_urls),
-                height=260,
-                disabled=True,
-            )
+            sitemap_records = [
+                record for record in crawl_valid_records if record["is_sitemap"]
+            ]
+            other_records = [
+                record for record in crawl_valid_records if not record["is_sitemap"]
+            ]
+
+            sitemap_col, other_col = st.columns(2)
+            with sitemap_col:
+                st.markdown("#### Sitemap pages")
+                st.text_area(
+                    "Sitemap pages list",
+                    value="\n".join(
+                        f'[{record["status_code"]}] {record["url"]}'
+                        for record in sitemap_records
+                    ),
+                    height=260,
+                    disabled=True,
+                )
+            with other_col:
+                st.markdown("#### Other pages")
+                st.text_area(
+                    "Other pages list",
+                    value="\n".join(
+                        f'[{record["status_code"]}] {record["url"]}'
+                        for record in other_records
+                    ),
+                    height=260,
+                    disabled=True,
+                )
+
+            with st.expander(f"Excluded pages: {len(crawl_excluded_records)}"):
+                st.text_area(
+                    "Excluded pages with reasons",
+                    value="\n".join(
+                        f'[{record["status_code"]}] {record["url"]} -> {record["reason"]}'
+                        for record in crawl_excluded_records
+                    ),
+                    height=220,
+                    disabled=True,
+                )
 
             if st.button("Send collected URLs to OmegaIndexer", type="primary"):
                 if not api_key:
