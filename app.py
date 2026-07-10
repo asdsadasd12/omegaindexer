@@ -13,6 +13,8 @@ GOOGLEBOT_UA = (
     "Mozilla/5.0 (compatible; Googlebot/2.1; "
     "+http://www.google.com/bot.html)"
 )
+SITEMAP_PRIORITY_MARKER = "/sitemap-page"
+DEFAULT_SITEMAP_PRIORITY_PATH = "/top/sitemap-page-1/"
 
 
 @dataclass
@@ -74,12 +76,49 @@ def build_pipe_delimited_urls(urls: Iterable[str]) -> str:
     return "|".join(urls)
 
 
-def fetch_homepage_links(site_url: str, timeout: int = 20) -> list[str]:
+def build_start_url(site_url: str, start_path: str) -> str:
     normalized_site = normalize_url(site_url)
+    cleaned_path = start_path.strip() or "/"
+    if not cleaned_path.startswith("/"):
+        cleaned_path = f"/{cleaned_path}"
+    return urljoin(f"{normalized_site}/", cleaned_path.lstrip("/"))
+
+
+def prioritize_and_limit_urls(
+    urls: Iterable[str],
+    max_urls: int,
+    prioritize_sitemap: bool,
+) -> list[str]:
+    unique_urls, _ = deduplicate_urls(urls)
+    if not prioritize_sitemap:
+        return unique_urls[:max_urls]
+
+    prioritized_urls = [
+        url for url in unique_urls if SITEMAP_PRIORITY_MARKER in url.lower()
+    ]
+    regular_urls = [
+        url for url in unique_urls if SITEMAP_PRIORITY_MARKER not in url.lower()
+    ]
+    ordered_urls = prioritized_urls + regular_urls
+    return ordered_urls[:max_urls]
+
+
+def build_priority_sitemap_url(site_url: str) -> str:
+    normalized_site = normalize_url(site_url)
+    return urljoin(f"{normalized_site}/", DEFAULT_SITEMAP_PRIORITY_PATH.lstrip("/"))
+
+
+def fetch_homepage_links(
+    site_url: str,
+    start_path: str = "/",
+    timeout: int = 20,
+) -> list[str]:
+    normalized_site = normalize_url(site_url)
+    start_url = build_start_url(normalized_site, start_path)
     site_host = urlparse(normalized_site).netloc
 
     response = requests.get(
-        normalized_site,
+        start_url,
         headers={"User-Agent": GOOGLEBOT_UA},
         timeout=timeout,
     )
@@ -93,7 +132,7 @@ def fetch_homepage_links(site_url: str, timeout: int = 20) -> list[str]:
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
             continue
 
-        absolute_url = urljoin(normalized_site + "/", href)
+        absolute_url = urljoin(start_url, href)
         parsed = urlparse(absolute_url)
 
         if parsed.scheme not in {"http", "https"}:
@@ -154,6 +193,21 @@ def main() -> None:
             max_value=60,
             value=20,
             step=1,
+        )
+        crawl_limit = st.number_input(
+            "Max pages to keep",
+            min_value=1,
+            max_value=1000,
+            value=100,
+            step=1,
+        )
+        prioritize_sitemap = st.checkbox(
+            "Prioritize Sitemap Page URLs",
+            value=True,
+            help=(
+                "Places URLs like `/sitemap-page-1/` at the top and keeps "
+                "them first inside the page limit."
+            ),
         )
         render_payload_help()
 
@@ -218,6 +272,11 @@ def main() -> None:
             value="Homepage crawl campaign",
             key="crawl_campaign_name",
         )
+        start_path = st.text_input(
+            "Page path to parse",
+            value="/",
+            help="Default is the main homepage of each site.",
+        )
 
         if st.button("Fetch homepage links"):
             sites = split_lines(sites_input)
@@ -231,19 +290,31 @@ def main() -> None:
                     try:
                         links = fetch_homepage_links(
                             site,
+                            start_path=start_path,
                             timeout=int(request_timeout),
                         )
                     except Exception as exc:  # noqa: BLE001
                         results[site] = {"error": str(exc), "links": []}
                     else:
+                        if prioritize_sitemap:
+                            links = [build_priority_sitemap_url(site)] + links
                         results[site] = {"error": "", "links": links}
                         all_urls.extend(links)
 
                 unique_crawl_urls, removed_duplicates = deduplicate_urls(all_urls)
+                filtered_crawl_urls = prioritize_and_limit_urls(
+                    unique_crawl_urls,
+                    max_urls=int(crawl_limit),
+                    prioritize_sitemap=prioritize_sitemap,
+                )
                 st.session_state["crawl_results"] = results
-                st.session_state["crawl_urls"] = unique_crawl_urls
-                st.session_state["selected_crawl_urls"] = list(unique_crawl_urls)
+                st.session_state["crawl_urls"] = filtered_crawl_urls
+                st.session_state["selected_crawl_urls"] = list(filtered_crawl_urls)
                 st.session_state["crawl_duplicates_removed"] = removed_duplicates
+                st.session_state["crawl_total_before_limit"] = len(unique_crawl_urls)
+                st.session_state["crawl_limit_applied"] = int(crawl_limit)
+                st.session_state["crawl_prioritize_sitemap"] = prioritize_sitemap
+                st.session_state["crawl_start_path"] = start_path.strip() or "/"
 
         crawl_results = st.session_state.get("crawl_results")
         crawl_urls = st.session_state.get("crawl_urls", [])
@@ -251,6 +322,16 @@ def main() -> None:
             "crawl_duplicates_removed",
             0,
         )
+        crawl_total_before_limit = st.session_state.get(
+            "crawl_total_before_limit",
+            len(crawl_urls),
+        )
+        crawl_limit_applied = st.session_state.get("crawl_limit_applied", 100)
+        crawl_prioritize_sitemap = st.session_state.get(
+            "crawl_prioritize_sitemap",
+            True,
+        )
+        crawl_start_path = st.session_state.get("crawl_start_path", "/")
 
         if crawl_results:
             st.markdown("### Results")
@@ -264,6 +345,15 @@ def main() -> None:
 
             st.markdown(f"### Total unique URLs: {len(crawl_urls)}")
             st.caption(f"Removed duplicates: {crawl_duplicates_removed}")
+            st.caption(
+                f"Start page: {crawl_start_path} | "
+                f"Before limit: {crawl_total_before_limit} | "
+                f"Limit applied: {crawl_limit_applied}"
+            )
+            if crawl_prioritize_sitemap:
+                st.caption(
+                    "Sitemap Page priority is enabled. Matching URLs are kept first."
+                )
 
             action_col_1, action_col_2, action_col_3 = st.columns(3)
             with action_col_1:
